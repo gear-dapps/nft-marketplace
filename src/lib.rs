@@ -1,8 +1,7 @@
 #![no_std]
 
-use gstd::{exec, msg, prelude::*, ActorId};
+use gstd::{errors::Result as GstdResult, msg, prelude::*, ActorId, MessageId};
 pub use market_io::*;
-use primitive_types::{H256, U256};
 pub mod nft_messages;
 use nft_messages::*;
 pub mod auction;
@@ -17,6 +16,7 @@ pub type ContractAndTokenId = String;
 const MIN_TREASURY_FEE: u8 = 0;
 const MAX_TREASURT_FEE: u8 = 5;
 pub const BASE_PERCENT: u8 = 100;
+pub const MINIMUM_VALUE: u64 = 500;
 
 #[derive(Debug, Default, Encode, Decode, TypeInfo)]
 #[codec(crate = gstd::codec)]
@@ -25,39 +25,44 @@ pub struct Market {
     pub admin_id: ActorId,
     pub treasury_id: ActorId,
     pub treasury_fee: u8,
-    pub items: BTreeMap<ContractAndTokenId, Item>,
+    pub items: BTreeMap<(ContractId, TokenId), Item>,
     pub approved_nft_contracts: BTreeSet<ActorId>,
     pub approved_ft_contracts: BTreeSet<ActorId>,
+    pub tx_id: TransactionId,
 }
 
 static mut MARKET: Option<Market> = None;
 
 impl Market {
-    fn add_nft_contract(&mut self, nft_contract_id: &ActorId) {
+    fn add_nft_contract(&mut self, nft_contract_id: &ContractId) -> Result<MarketEvent, MarketErr> {
         self.check_admin();
         self.approved_nft_contracts.insert(*nft_contract_id);
+        Ok(MarketEvent::NftContractAdded(*nft_contract_id))
     }
 
-    fn add_ft_contract(&mut self, ft_contract_id: &ActorId) {
+    fn add_ft_contract(&mut self, ft_contract_id: &ContractId) -> Result<MarketEvent, MarketErr> {
         self.check_admin();
         self.approved_ft_contracts.insert(*ft_contract_id);
+        Ok(MarketEvent::FtContractAdded(*ft_contract_id))
     }
 
     pub async fn add_market_data(
         &mut self,
-        nft_contract_id: &ActorId,
-        ft_contract_id: Option<ActorId>,
-        token_id: U256,
-        price: Option<u128>,
-    ) {
+        nft_contract_id: &ContractId,
+        ft_contract_id: Option<ContractId>,
+        token_id: TokenId,
+        price: Option<Price>,
+    ) -> Result<MarketEvent, MarketErr> {
         self.check_approved_nft_contract(nft_contract_id);
         self.check_approved_ft_contract(ft_contract_id);
-        let contract_and_token_id =
-            format!("{}{token_id}", H256::from_slice(nft_contract_id.as_ref()));
-        self.on_auction(&contract_and_token_id);
+        let contract_and_token_id = (*nft_contract_id, token_id);
 
-        nft_approve(nft_contract_id, &exec::program_id(), token_id).await;
-
+        let owner = get_owner(nft_contract_id, token_id).await;
+        assert_eq!(
+            owner,
+            msg::source(),
+            "Only owner has a right to add NFT to the marketplace"
+        );
         self.items
             .entry(contract_and_token_id)
             .and_modify(|item| {
@@ -65,23 +70,21 @@ impl Market {
                 item.ft_contract_id = ft_contract_id
             })
             .or_insert(Item {
-                owner_id: msg::source(),
+                owner,
                 ft_contract_id,
                 price,
                 auction: None,
-                offers: Vec::new(),
+                offers: BTreeMap::new(),
+                bids: BTreeMap::new(),
+                tx: None,
             });
 
-        msg::reply(
-            MarketEvent::MarketDataAdded {
-                nft_contract_id: *nft_contract_id,
-                owner: msg::source(),
-                token_id,
-                price,
-            },
-            0,
-        )
-        .expect("Error in reply [MarketEvent::MarketDataAdded]");
+        Ok(MarketEvent::MarketDataAdded {
+            nft_contract_id: *nft_contract_id,
+            owner: msg::source(),
+            token_id,
+            price,
+        })
     }
 
     pub fn check_admin(&self) {
@@ -111,13 +114,9 @@ impl Market {
 async fn main() {
     let action: MarketAction = msg::load().expect("Could not load Action");
     let market: &mut Market = unsafe { MARKET.get_or_insert(Market::default()) };
-    match action {
-        MarketAction::AddNftContract(nft_contract_id) => {
-            market.add_nft_contract(&nft_contract_id);
-        }
-        MarketAction::AddFTContract(nft_contract_id) => {
-            market.add_ft_contract(&nft_contract_id);
-        }
+    let result = match action {
+        MarketAction::AddNftContract(nft_contract_id) => market.add_nft_contract(&nft_contract_id),
+        MarketAction::AddFTContract(nft_contract_id) => market.add_ft_contract(&nft_contract_id),
         MarketAction::AddMarketData {
             nft_contract_id,
             ft_contract_id,
@@ -126,28 +125,12 @@ async fn main() {
         } => {
             market
                 .add_market_data(&nft_contract_id, ft_contract_id, token_id, price)
-                .await;
+                .await
         }
         MarketAction::BuyItem {
             nft_contract_id,
             token_id,
-        } => {
-            market.buy_item(&nft_contract_id, token_id).await;
-        }
-        MarketAction::Item {
-            nft_contract_id,
-            token_id,
-        } => {
-            let contract_and_token_id =
-                format!("{}{token_id}", H256::from_slice(nft_contract_id.as_ref()));
-            let item = market
-                .items
-                .get(&contract_and_token_id)
-                .expect("Item does not exist")
-                .clone();
-            msg::reply(MarketEvent::ItemInfo(item), 0)
-                .expect("Error in reply [MarketEvent::ItemInfo]");
-        }
+        } => market.buy_item(&nft_contract_id, token_id).await,
         MarketAction::AddOffer {
             nft_contract_id,
             ft_contract_id,
@@ -161,17 +144,23 @@ async fn main() {
         MarketAction::AcceptOffer {
             nft_contract_id,
             token_id,
-            offer_hash,
+            ft_contract_id,
+            price,
         } => {
             market
-                .accept_offer(&nft_contract_id, token_id, offer_hash)
+                .accept_offer(&nft_contract_id, token_id, ft_contract_id, price)
                 .await
         }
         MarketAction::Withdraw {
             nft_contract_id,
+            ft_contract_id,
             token_id,
-            hash,
-        } => market.withdraw(&nft_contract_id, token_id, hash).await,
+            price,
+        } => {
+            market
+                .withdraw(&nft_contract_id, token_id, ft_contract_id, price)
+                .await
+        }
         MarketAction::CreateAuction {
             nft_contract_id,
             ft_contract_id,
@@ -189,7 +178,7 @@ async fn main() {
                     bid_period,
                     duration,
                 )
-                .await;
+                .await
         }
         MarketAction::AddBid {
             nft_contract_id,
@@ -200,10 +189,10 @@ async fn main() {
         MarketAction::SettleAuction {
             nft_contract_id,
             token_id,
-        } => {
-            market.settle_auction(&nft_contract_id, token_id).await;
-        }
-    }
+        } => market.settle_auction(&nft_contract_id, token_id).await,
+    };
+    reply(result)
+        .expect("Failed to encode or reply with `Result<MarketEvent, MarketErr>`");
 }
 
 #[no_mangle]
@@ -243,9 +232,7 @@ extern "C" fn meta_state() -> *mut [i32; 2] {
             nft_contract_id,
             token_id,
         } => {
-            let contract_and_token_id =
-                format!("{}{token_id}", H256::from_slice(nft_contract_id.as_ref()));
-            if let Some(item) = market.items.get(&contract_and_token_id) {
+            if let Some(item) = market.items.get(&(nft_contract_id, token_id)) {
                 StateReply::ItemInfo(item.clone()).encode()
             } else {
                 StateReply::ItemInfo(Item::default()).encode()
@@ -253,4 +240,8 @@ extern "C" fn meta_state() -> *mut [i32; 2] {
         }
     };
     gstd::util::to_leak_ptr(encoded)
+}
+
+fn reply(payload: impl Encode) -> GstdResult<MessageId> {
+    msg::reply(payload, 0)
 }
